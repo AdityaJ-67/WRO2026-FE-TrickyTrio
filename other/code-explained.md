@@ -821,9 +821,12 @@ def speed_to_duty(speed):
     return speed, int(speed * 65535 / 100)
 ```
 
-`max(0, ...)` is doing something specific: **negative speed becomes stop, not reverse.**
-Reverse is deliberately not implemented, so a bad value has to mean stop rather than
-something surprising. The self test checks this explicitly.
+The sign is preserved and the duty comes back positive. On a DRV8833 the direction is
+decided by **which** of the two inputs carries the PWM, not by the value on it, so the
+caller uses the sign to pick the input and the magnitude to set the speed.
+
+Reverse exists because parallel parking needs it, and so does backing out of a bad park
+or recovering when the robot wedges itself.
 
 ```python
 FREQ = 20_000

@@ -326,21 +326,29 @@ STATE_HOLDS_STRAIGHT = (State.WAIT_FOR_START, State.INITIALISE, State.FINISHED)
 
 
 def apply_state(state, navigation_output):
-    """The final command: navigation's request, restrained by the current state."""
+    """The final command: navigation's request, restrained by the current state.
+
+    Speed is signed, so the limits are applied to how fast we are going rather
+    than to the number itself. Taking `max(speed, floor)` on a reversing robot
+    would turn a gentle reverse into a forward lurch, which is exactly the kind
+    of mistake that only shows up once something asks to go backwards.
+    """
     navigation_output = navigation_output or {}
     speed = navigation_output.get("speed", 0)
+    direction = -1 if speed < 0 else 1
+    magnitude = abs(speed)
 
     # Floor first, then cap - so a cap of 0 always wins and FINISHED really stops.
     floor = STATE_SPEED_FLOOR[state]
     if floor is not None:
-        speed = max(speed, floor)
+        magnitude = max(magnitude, floor)
     cap = STATE_SPEED_CAP[state]
     if cap is not None:
-        speed = min(speed, cap)
+        magnitude = min(magnitude, cap)
 
     steering = (0 if state in STATE_HOLDS_STRAIGHT
                 else navigation_output.get("steering", 0))
-    return int(speed), int(steering)
+    return int(direction * magnitude), int(steering)
 
 
 def heading_change(start, current):
@@ -874,6 +882,16 @@ def selftest():
     # --- the state machine restrains navigation, never invents a command ---
     assert set(STATE_SPEED_CAP) == set(State), "a state has no speed cap"
     assert set(STATE_SPEED_FLOOR) == set(State), "a state has no speed floor"
+
+    # --- speed limits act on how fast, not on the signed number ---
+    reversing = {"speed": -20, "steering": 0}
+    # a cap slows a reverse without flipping it forwards
+    assert apply_state(State.RECOVERY, reversing)[0] == -20
+    assert apply_state(State.TURN_CORNER, {"speed": -50, "steering": 0})[0] == -35
+    # a floor speeds a slow reverse up, still backwards
+    assert apply_state(State.ENTER_PARKING, {"speed": -5, "steering": 0})[0] == -15
+    # and a cap of zero still means stop, in either direction
+    assert apply_state(State.FINISHED, reversing) == (0, 0)
 
     # a corner keeps moving even when navigation has given up, or it deadlocks
     assert apply_state(State.TURN_CORNER, {"speed": 0, "steering": 18})[0] > 0
