@@ -10,10 +10,18 @@ or recomputes a contour property it already has.
 Run:  python vision_test.py
       python vision_test.py --selftest    (no camera needed)
 
-Keys: Q quit, M toggle mask view (use it to tune the HSV ranges on the mat).
+Keys: Q quit
+      M toggle the mask view, which is how the HSV ranges get tuned
+      D toggle a half size window, which is much cheaper to draw on a Pi 3
+      P print the HSV value under the crosshair, for setting thresholds
+
+The readout in the corner separates processing time from total loop time. On a
+Pi 3 the processing is a few milliseconds and drawing the window is most of the
+rest, which is why the competition program does not open one.
 """
 
 import sys
+import time
 from math import radians, tan
 
 import cv2
@@ -31,6 +39,8 @@ CAMERA_HFOV_DEG = 62.2  # Pi Camera v2. CALIBRATE: put a block at a measured 50 
 # noise lives up there. Cropping it costs nothing and removes false positives.
 ROI_TOP = 0.35          # fraction of the frame ignored from the top
 PROC_WIDTH = 320        # detection runs on a downscaled copy; drawing stays full size
+DISPLAY_SCALE = 0.5     # window size relative to the frame, for the D key
+PROBE_PATCH = 12        # pixels either side of centre sampled by the P key
 
 MIN_AREA = 150          # px^2 at PROC_WIDTH. Small, so a far block still registers
 MIN_RATIO, MAX_RATIO = 0.15, 2.00   # w/h. Blocks are taller than wide, even clipped
@@ -48,23 +58,37 @@ BLOCK_HEIGHT_CM = 10.0  # WRO signal block
 WALL_HEIGHT_CM = 10.0   # mat wall
 
 # HSV ranges. Red wraps around hue 0, so it needs two ranges.
-# Saturation and value floors are deliberately low: a block in shadow on one side
-# of the mat is much darker than one under the lights, and a high floor silently
-# drops it while the other colour keeps working.
+#
+# Saturation and value do different jobs, and getting them the wrong way round
+# was a real bug. Putting an object in shadow lowers its VALUE but leaves its
+# SATURATION almost untouched, because saturation describes how pure the colour
+# is rather than how bright. So:
+#
+#   value floor stays LOW   - a block in shadow must still be found
+#   saturation floor stays HIGH - this is what separates a painted block from
+#                                 skin, cardboard and anything else vaguely warm
+#
+# Skin measures around hue 10 to 15 with saturation near 100. A printed traffic
+# sign sits well above 180. The floor below is set between the two.
 COLOUR_RANGES = {
-    "RED": [((0, 90, 40), (10, 255, 255)), ((172, 90, 40), (180, 255, 255))],
-    "GREEN": [((35, 70, 35), (90, 255, 255))],
+    "RED": [((0, 150, 40), (10, 255, 255)), ((172, 150, 40), (180, 255, 255))],
+    "GREEN": [((35, 120, 35), (90, 255, 255))],
 }
 
 # The parking markers are magenta, which sits immediately below red on the hue
 # circle - close enough that the old upper-red band (165+) swallowed it. Red now
 # starts at 172 instead, which costs nothing because red also has the 0-10 band.
-MAGENTA_RANGE = [((140, 70, 60), (170, 255, 255))]
+MAGENTA_RANGE = [((140, 120, 60), (170, 255, 255))]
 MARKER_MIN_AREA = 120       # px^2 at PROC_WIDTH. Markers are seen from far off.
 MARKER_HEIGHT_CM = 10.0     # CHECK against the rulebook and a ruler
-# The wall is black: any hue, any saturation, just dark. Raise the 60 if the mat
-# itself starts registering, lower it if the wall goes missing in bright light.
-WALL_RANGE = [((0, 0, 0), (180, 255, 60))]
+# The wall is black, and black means dark AND colourless. The saturation ceiling
+# is what stops every dark object in the room registering as track: dark clothing
+# measures around saturation 150, a black wall around 20. Without that ceiling a
+# navy jumper at the edge of frame corrupts the lane measurement.
+#
+# The floor of the track is white, so there is a wide gap between wall and floor
+# in value, which is why this threshold can afford to be strict.
+WALL_RANGE = [((0, 0, 0), (180, 70, 70))]
 
 DRAW_COLOUR = {"RED": (0, 0, 255), "GREEN": (0, 255, 0), "WALL": (255, 200, 0),
                "PARKING": (255, 0, 255)}
@@ -277,6 +301,22 @@ def draw(frame, name, info):
                 (x, y + h + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2)
 
 
+def probe_hsv(frame):
+    """Average HSV of a small patch at the centre of the frame.
+
+    Point the crosshair at a real traffic sign on the real mat and press P. The
+    numbers printed are what the thresholds have to accept. Saturation is the
+    one that matters most: it is what separates a painted sign from skin or
+    cardboard, and unlike value it barely changes when the sign is in shadow.
+    """
+    height, width = frame.shape[:2]
+    cy, cx = height // 2, width // 2
+    patch = frame[cy - PROBE_PATCH:cy + PROBE_PATCH,
+                  cx - PROBE_PATCH:cx + PROBE_PATCH]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    return [int(round(v)) for v in cv2.mean(hsv)[:3]]
+
+
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
@@ -286,6 +326,11 @@ def main():
         sys.exit(f"Could not open camera {CAMERA_INDEX}")
 
     show_mask = False
+    small_window = False
+    detect_ms = loop_ms = 0.0
+    last_loop = time.perf_counter()
+
+    print("Q quit   M mask view   D half size window   P probe HSV at centre")
 
     while True:
         ok, frame = cap.read()
@@ -295,7 +340,10 @@ def main():
 
         height, width = frame.shape[:2]
         roi_y = int(height * ROI_TOP)
+
+        started = time.perf_counter()
         seen, masks, walls = detect(frame)
+        detect_ms = 0.8 * detect_ms + 0.2 * (time.perf_counter() - started) * 1000
 
         if show_mask:
             combined = (masks["RED"] | masks["GREEN"] | masks["WALL"]
@@ -316,12 +364,33 @@ def main():
         cv2.line(frame, (centre, 40), (centre + int(walls["balance"] * 120), 40),
                  (255, 200, 0), 6)
 
-        cv2.imshow("vision test", frame)
+        # Processing time against total loop time. If these differ a lot, the
+        # window is the cost, not the vision.
+        cv2.putText(frame, "detect %.1f ms   loop %.0f ms   %.0f fps"
+                    % (detect_ms, loop_ms, 1000 / max(loop_ms, 1e-6)),
+                    (10, height - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 2)
+        cv2.drawMarker(frame, (width // 2, height // 2), (0, 255, 255),
+                       cv2.MARKER_CROSS, 18, 1)
+
+        cv2.imshow("vision test",
+                   cv2.resize(frame, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
+                   if small_window else frame)
+
+        now = time.perf_counter()
+        loop_ms = 0.8 * loop_ms + 0.2 * (now - last_loop) * 1000
+        last_loop = now
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         if key == ord("m"):
             show_mask = not show_mask
+        if key == ord("d"):
+            small_window = not small_window
+        if key == ord("p"):
+            hue, sat, val = probe_hsv(frame)
+            print("centre HSV  H %3d  S %3d  V %3d" % (hue, sat, val))
 
     cap.release()
     cv2.destroyAllWindows()
