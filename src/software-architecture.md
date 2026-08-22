@@ -292,6 +292,31 @@ offset is back inside the dead zone.
 **`PASS_PILLAR` has no route to recovery**, deliberately. Losing sight of a sign you are
 squeezing past is what success looks like, so both exits lead to recentring.
 
+### Parking markers as lane boundary
+
+The magenta markers stand on the track for the whole run, not only at the end of it.
+The starting straight contains the parking lot, so the robot drives past the markers on
+every one of the three laps.
+
+Anything that only looks for magenta while parking cannot see them the rest of the time,
+and will knock them over.
+
+So the markers are counted as **boundary**, alongside the black wall, in the same side
+bands used for lane keeping. A marker on the left pushes the robot right exactly as a
+wall would, using steering logic that already existed.
+
+They are counted separately from the wall rather than merged into it, because while
+parking they are the **target** rather than an obstacle. Treating them as boundary then
+would steer the robot away from the slot it is trying to enter. One flag,
+`avoid_markers`, decides which of the two they are, and it is false only in the parking
+modes.
+
+| Situation | Marker on the left | Steering |
+|---|---|---|
+| Driving a lap | Boundary | Right, away from it |
+| Recentring after a sign | Boundary | Right, away from it |
+| Searching for the slot | Target | Straight, not pushed off |
+
 ## Algorithm Justification
 
 ### Why proportional control and not PID

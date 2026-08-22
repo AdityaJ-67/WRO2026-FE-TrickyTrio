@@ -209,20 +209,41 @@ def lane_offset(left_mm, right_mm):
     return 0.0 if abs(offset) < LANE_DEAD_ZONE else offset
 
 
-def wall_balance(walls):
-    """Lane offset from the camera, or None when there is too little wall in view.
+def boundary_bands(walls, avoid_markers=True):
+    """Left and right pixel counts of everything bounding the lane.
 
-    Positive means more wall on the left, so the robot has drifted left.
+    The black track wall always counts. The magenta parking markers count too
+    during ordinary driving, because they stand on the track for the whole run
+    and a robot that cannot see them will knock them over on every lap.
+
+    While parking they are deliberately excluded. The markers are the target
+    then, not an obstacle, and treating them as boundary would steer the robot
+    away from the very slot it is trying to enter.
+    """
+    left, right = walls["left"], walls["right"]
+    if avoid_markers:
+        left += walls.get("marker_left", 0)
+        right += walls.get("marker_right", 0)
+    return left, right
+
+
+def wall_balance(walls, avoid_markers=True):
+    """Lane offset from the camera, or None when too little boundary is in view.
+
+    Positive means more boundary on the left, so the robot has drifted left and
+    should steer right.
     """
     if not walls:
         return None
-    if walls["left"] + walls["right"] < WALL_BAND_MIN_PIXELS:
+    left, right = boundary_bands(walls, avoid_markers)
+    total = left + right
+    if total < WALL_BAND_MIN_PIXELS:
         return None
-    balance = walls["balance"]
+    balance = (left - right) / total
     return 0.0 if abs(balance) < LANE_DEAD_ZONE else balance
 
 
-def compute_lane_steering(left_mm, right_mm, walls=None):
+def compute_lane_steering(left_mm, right_mm, walls=None, avoid_markers=True):
     """Steer back towards the middle of the lane.
 
     Two independent measurements of the same thing, tried in order of freshness.
@@ -230,7 +251,7 @@ def compute_lane_steering(left_mm, right_mm, walls=None):
     accurate but up to a sweep old by the time they are used. Falling back
     rather than averaging keeps the behaviour predictable when one disagrees.
     """
-    balance = wall_balance(walls)
+    balance = wall_balance(walls, avoid_markers)
     if balance is not None:
         return (max(-MAX_STEERING_DEG,
                     min(MAX_STEERING_DEG, balance * WALL_BALANCE_GAIN)), balance)
@@ -285,7 +306,10 @@ def compute_steering(pillar, previous_steering, mode=None,
         # Steer for the slot when we can see it; hold the lane while hunting.
         target = compute_parking_steering(parking)
         if target is None:
-            target, lane = compute_lane_steering(left_mm, right_mm, walls)
+            # Hunting for the slot: hold the lane, but do not treat the markers
+            # we are looking for as something to steer away from.
+            target, lane = compute_lane_steering(left_mm, right_mm, walls,
+                                                 avoid_markers=False)
         offset = target_offset = 0.0
     elif mode == MODE_TURN_CORNER:
         target, lane = compute_corner_steering(left_mm, right_mm,
@@ -716,6 +740,37 @@ def selftest():
         camera_lane = compute_navigation(
             {"pillars": [], "walls": hug_left}, {"front_distance": far})
     assert camera_lane["steering"] > 0, camera_lane
+
+    # --- the parking markers are boundary while driving, target while parking ---
+    marker_on_left = {"left": 0, "right": 0, "balance": 0.0,
+                      "marker_left": 700, "marker_right": 0}
+
+    # driving past them: they push the robot away, to the right
+    assert wall_balance(marker_on_left) > 0.9
+    assert compute_lane_steering(None, None, marker_on_left)[0] > 0
+
+    # ...and a marker on the right pushes the other way
+    marker_on_right = {"left": 0, "right": 0, "balance": 0.0,
+                       "marker_left": 0, "marker_right": 700}
+    assert compute_lane_steering(None, None, marker_on_right)[0] < 0
+
+    # while parking they are ignored, so we are not pushed off the slot
+    assert wall_balance(marker_on_left, avoid_markers=False) is None
+    assert compute_lane_steering(None, None, marker_on_left,
+                                 avoid_markers=False)[0] == STRAIGHT_STEERING_DEG
+
+    # wall and markers on opposite sides add up rather than cancelling wrongly
+    both = {"left": 400, "right": 0, "balance": 1.0,
+            "marker_left": 0, "marker_right": 400}
+    assert abs(wall_balance(both)) < LANE_DEAD_ZONE, wall_balance(both)
+
+    # end to end: a marker ahead on the left steers the robot right, every mode
+    for parking_mode in (None, MODE_RECENTER):
+        reset()
+        for _ in range(14):
+            avoided = compute_navigation({"pillars": [], "walls": marker_on_left},
+                                         {"front_distance": far}, parking_mode)
+        assert avoided["steering"] > 0, (parking_mode, avoided)
 
     # --- missions ---
     red_centred = [pillar(COLOUR_RED, CAMERA_CENTRE_X)]

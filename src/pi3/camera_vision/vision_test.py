@@ -129,8 +129,15 @@ def find_block(mask):
     return best
 
 
-def wall_bands(wall_mask):
-    """How much wall fills each side of the frame, and the balance between them.
+def band_pixels(mask):
+    """Pixels set in the left and right side bands of a mask."""
+    height, width = mask.shape
+    band = int(width * WALL_BAND_WIDTH)
+    return cv2.countNonZero(mask[:, :band]), cv2.countNonZero(mask[:, width - band:])
+
+
+def wall_bands(wall_mask, marker_mask=None):
+    """How much boundary fills each side of the frame, and the balance between them.
 
     Returns (left, right, balance). Balance runs -1 to +1, and positive means
     more wall on the left, so the robot has drifted towards the left wall and
@@ -143,13 +150,20 @@ def wall_bands(wall_mask):
 
     Dividing by the total is what makes it independent of resolution and of how
     brightly the walls happen to be lit.
+
+    The magenta parking markers are counted separately and returned alongside.
+    They stand on the track for the whole run, not only while parking, so
+    anything driving past them has to see them as boundary or it will knock them
+    over on every lap. They are kept as their own numbers rather than merged
+    here, because while parking we steer towards them rather than away.
     """
-    height, width = wall_mask.shape
-    band = int(width * WALL_BAND_WIDTH)
-    left = cv2.countNonZero(wall_mask[:, :band])
-    right = cv2.countNonZero(wall_mask[:, width - band:])
+    left, right = band_pixels(wall_mask)
     total = left + right
-    return left, right, 0.0 if total == 0 else (left - right) / total
+    marker_left, marker_right = ((0, 0) if marker_mask is None
+                                 else band_pixels(marker_mask))
+    return {"left": left, "right": right,
+            "balance": 0.0 if total == 0 else (left - right) / total,
+            "marker_left": marker_left, "marker_right": marker_right}
 
 
 def find_wall(mask):
@@ -275,8 +289,7 @@ def detect(frame):
     if parking:
         seen["PARKING"] = parking
 
-    left, right, balance = wall_bands(masks["WALL"])
-    walls = {"left": left, "right": right, "balance": balance}
+    walls = wall_bands(masks["WALL"], masks["PARKING"])
     return seen, masks, walls
 
 
@@ -356,8 +369,10 @@ def main():
 
         cv2.line(frame, (width // 2, roi_y), (width // 2, height), (200, 200, 200), 1)
         cv2.line(frame, (0, roi_y), (width, roi_y), (200, 200, 200), 1)
-        cv2.putText(frame, "wall L%d R%d  balance %+.2f"
-                    % (walls["left"], walls["right"], walls["balance"]),
+        cv2.putText(frame, "wall L%d R%d  markers L%d R%d  balance %+.2f"
+                    % (walls["left"], walls["right"],
+                       walls["marker_left"], walls["marker_right"],
+                       walls["balance"]),
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         # a bar showing which way the wall balance is pushing the steering
         centre = width // 2
@@ -439,6 +454,21 @@ def selftest():
 
     # no wall in view at all gives no signal rather than a wrong one
     assert detect(np.full((480, 640, 3), 150, np.uint8))[2]["balance"] == 0.0
+
+    # --- parking markers are seen as boundary during ordinary driving ---
+    # a marker standing at the left edge, with no wall anywhere
+    marker_left = np.full((480, 640, 3), 150, np.uint8)
+    cv2.rectangle(marker_left, (20, 300), (90, 430), (255, 0, 255), -1)
+    bands = detect(marker_left)[2]
+    assert bands["marker_left"] > 100, bands
+    assert bands["marker_right"] == 0, bands
+    # the wall numbers stay clean, so the two are never confused
+    assert bands["left"] == 0 and bands["right"] == 0, bands
+
+    # and on the other side
+    marker_right = np.full((480, 640, 3), 150, np.uint8)
+    cv2.rectangle(marker_right, (549, 300), (619, 430), (255, 0, 255), -1)
+    assert detect(marker_right)[2]["marker_right"] > 100
 
     # nothing but mat -> nothing seen
     empty, _, _ = detect(np.full((480, 640, 3), 150, np.uint8))
